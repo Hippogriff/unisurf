@@ -17,14 +17,15 @@ class DepthNetwork(nn.Module):
         self.num_layers = cfg['num_layers']
         hidden_size = cfg['hidden_dim']
         self.octaves_pe_views = cfg['octaves_pe_views']
+        self.octaves_pe = cfg['octaves_pe']
         self.skips = cfg['skips']
         geometric_init = cfg['geometric_init']
 
         bias = 0.6
-
         # init pe
-        dim_embed_view = dim + dim * self.octaves_pe_views * 2
+        dim_embed_view = dim + dim * self.octaves_pe_views * 2 + dim * self.octaves_pe * 2 + dim
         self.transform_points_view = PositionalEncoding(L=self.octaves_pe_views)
+        self.transform_points = PositionalEncoding(L=self.octaves_pe)
 
         ### depth network
         dims_geo = [dim_embed_view] + [hidden_size if i in self.skips else hidden_size for i in
@@ -43,16 +44,19 @@ class DepthNetwork(nn.Module):
             # TODO Needs to revisit this
             if geometric_init:
                 if l == self.num_layers - 2:
+                    # TODO Look into this bias??
                     torch.nn.init.normal_(lin.weight, mean=np.sqrt(np.pi) / np.sqrt(dims_geo[l]), std=0.0001)
                     torch.nn.init.constant_(lin.bias, -bias)
                 elif self.octaves_pe_views > 0 and l == 0:
                     torch.nn.init.constant_(lin.bias, 0.0)
-                    torch.nn.init.constant_(lin.weight[:, 3:], 0.0)
-                    torch.nn.init.normal_(lin.weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
+                    # NOTE assuming that first 6 weights corresponds to location and direction  values
+                    torch.nn.init.constant_(lin.weight[:, 3 * 2:], 0.0)
+                    torch.nn.init.normal_(lin.weight[:, :3 * 2], 0.0, np.sqrt(2) / np.sqrt(out_dim))
                 elif self.octaves_pe_views > 0 and l in self.skips:
                     torch.nn.init.constant_(lin.bias, 0.0)
                     torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
-                    torch.nn.init.constant_(lin.weight[:, -(dims_geo[0] - 3):], 0.0)
+                    # NOTE assuming that first 6 weights corresponds to location and direction  values
+                    torch.nn.init.constant_(lin.weight[:, -(dims_geo[0] - 3 * 2):], 0.0)
                 else:
                     torch.nn.init.constant_(lin.bias, 0.0)
                     torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
@@ -67,13 +71,16 @@ class DepthNetwork(nn.Module):
         self.tanh = nn.Tanh()
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, r):
-        pe = self.transform_points_view(r)
-        x = pe
+    def forward(self, x, r):
+        pe_v = self.transform_points_view(r, concat=False)
+        pe_x = self.transform_points(x, concat=False)
+
+        x_input = torch.cat([x, r, pe_x, pe_v], -1)
+        x = x_input
         for l in range(0, self.num_layers - 1):
             lin = getattr(self, "lin" + str(l))
             if l in self.skips:
-                x = torch.cat([x, pe], -1) / np.sqrt(2)
+                x = torch.cat([x, x_input], -1) / np.sqrt(2)
             x = lin(x)
             if l < self.num_layers - 2:
                 x = self.softplus(x)
@@ -223,10 +230,13 @@ class PositionalEncoding(object):
     def __init__(self, L=10):
         self.L = L
 
-    def __call__(self, p):
+    def __call__(self, p, concat=True):
         pi = 1.0
         p_transformed = torch.cat([torch.cat(
             [torch.sin((2 ** i) * pi * p),
              torch.cos((2 ** i) * pi * p)],
             dim=-1) for i in range(self.L)], dim=-1)
-        return torch.cat([p, p_transformed], dim=-1)
+        if concat:
+            return torch.cat([p, p_transformed], dim=-1)
+        else:
+            return p_transformed
